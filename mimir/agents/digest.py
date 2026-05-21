@@ -360,20 +360,23 @@ def _format_alert_message(signal: dict) -> str:
     return "\n".join(lines)
 
 
-def _send_telegram_message(bot: Bot, chat_id: str, text: str) -> None:
-    """
-    Send a message via Telegram.
-    Splits messages longer than 4096 chars (Telegram's hard limit).
-    """
+def _send_telegram_message(bot, chat_id: str, text: str) -> None:
+    """Send a message via Telegram using direct HTTP call."""
+    import requests as req
     max_length = 4096
-    if len(text) <= max_length:
-        bot.send_message(
-            chat_id=chat_id,
-            text=text,
-            parse_mode=ParseMode.MARKDOWN,
-            disable_web_page_preview=True,
+    chunks = [text] if len(text) <= max_length else _split_message(text, max_length)
+    for i, chunk in enumerate(chunks):
+        prefix = f"_(part {i+1}/{len(chunks)})_\n\n" if len(chunks) > 1 else ""
+        req.post(
+            f"https://api.telegram.org/bot{bot.token}/sendMessage",
+            json={
+                "chat_id": chat_id,
+                "text": prefix + chunk,
+                "parse_mode": "Markdown",
+                "disable_web_page_preview": True,
+            },
+            timeout=15,
         )
-        return
 
     # Split on paragraph boundaries to avoid cutting mid-sentence
     chunks = _split_message(text, max_length)
@@ -446,7 +449,7 @@ def _get_signals_for_client(
     with get_conn() as conn:
         with conn.cursor() as cur:
             cur.execute("""
-                SELECT DISTINCT
+                SELECT
                     s.id,
                     s.company_id,
                     co.name AS company_name,
@@ -468,7 +471,7 @@ def _get_signals_for_client(
                   AND s.discovered_at >= NOW() - INTERVAL '%s hours'
                   AND s.relevance_score >= %s
                   AND s.is_duplicate = FALSE
-                ORDER BY s.relevance_score DESC, s.discovered_at DESC
+                ORDER BY relevance_score DESC, discovered_at DESC
             """, (client_id, lookback_hours, min_score))
             return [dict(row) for row in cur.fetchall()]
 
@@ -492,7 +495,7 @@ def _get_clients_watching_company(company_id: str) -> list[dict]:
     with get_conn() as conn:
         with conn.cursor() as cur:
             cur.execute("""
-                SELECT DISTINCT cl.id, cl.name, cl.telegram_chat_id
+                SELECT cl.id, cl.name, cl.telegram_chat_id
                 from platform.clients cl
                 JOIN mimir.client_watchlist_subscriptions cws ON cws.client_id = cl.id
                 JOIN mimir.watchlist_companies wc ON wc.watchlist_id = cws.watchlist_id
