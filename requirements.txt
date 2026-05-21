@@ -24,3 +24,4 @@ python-telegram-bot==21.6
 
 # Utilities
 python-dateutil==2.9.0          # Robust date parsing
+feedparser
