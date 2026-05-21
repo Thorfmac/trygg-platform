@@ -1,0 +1,26 @@
+# =============================================================
+# requirements.txt
+# =============================================================
+# Install everything with:
+#   pip install -r requirements.txt
+
+# Database
+psycopg2-binary==2.9.9          # PostgreSQL driver
+
+# Claude API
+anthropic==0.40.0               # Anthropic Python SDK
+
+# Scheduler
+APScheduler==3.10.4             # Job scheduler
+
+# HTTP requests (for NewsAPI and Ollama)
+requests==2.32.3
+
+# Environment variables
+python-dotenv==1.0.1
+
+# Telegram bot (for sending alerts and digests)
+python-telegram-bot==21.6
+
+# Utilities
+python-dateutil==2.9.0          # Robust date parsing
