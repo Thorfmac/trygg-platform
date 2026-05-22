@@ -4,21 +4,23 @@
 # Trygg Lex — regulatory feed ingestion agent.
 #
 # What it does:
-#   1. Fetches RSS feeds from FCA, PRA, ESMA, ICO, and EBA/DORA
+#   1. Fetches RSS feeds from FCA, PRA, ESMA, FCA Enforcement, EBA
 #   2. Parses each item — title, summary, link, published date
 #   3. Deduplicates against already-stored items
 #   4. Scores each item for general relevance using Claude Haiku
-#   5. Scores each item against each active client's firm profile
-#   6. Stores results in lex.regulatory_items
+#   5. For items scoring >=7, fetches the full document and
+#      extracts detailed intelligence (fines, deadlines, rule refs)
+#   6. Scores each item against each active client's firm profile
+#   7. Stores results in lex.regulatory_items
 #
 # Feed sources:
-#   FCA  — https://www.fca.org.uk/rss.xml (news + warnings)
-#   PRA  — https://www.bankofengland.co.uk/rss/news
-#   ESMA — https://www.esma.europa.eu/press-news/esma-news/rss.xml
-#   ICO  — https://ico.org.uk/about-the-ico/what-we-do/our-work-programme/project-updates/rss/
-#   EBA  — https://www.eba.europa.eu/rss/latest-news (covers DORA)
+#   FCA          — https://www.fca.org.uk/rss.xml
+#   PRA/BoE      — https://www.bankofengland.co.uk/rss/news
+#   ESMA         — https://www.esma.europa.eu/rss.xml
+#   FCA Enforce  — https://www.fca.org.uk/news/rss.xml
+#   EBA          — https://www.eba.europa.eu/news-press/news/rss.xml
 #
-# This agent runs once daily at 08:00 UTC via the scheduler.
+# Runs daily at 08:00 UTC via the scheduler.
 # =============================================================
 
 import hashlib
@@ -53,21 +55,24 @@ REGULATORY_FEEDS = [
     {
         "regulator": "esma",
         "name": "ESMA",
-        "url": "https://www.esma.europa.eu/press-news/esma-news/rss.xml",
+        "url": "https://www.esma.europa.eu/rss.xml",
     },
     {
-    "regulator": "fca_enforcement",
-    "name": "FCA Enforcement & Warnings",
-    "url": "https://www.fca.org.uk/news/rss.xml",
+        "regulator": "fca_enforcement",
+        "name": "FCA Enforcement & Warnings",
+        "url": "https://www.fca.org.uk/news/rss.xml",
     },
     {
-    "regulator": "eba",
-    "name": "EBA (DORA & prudential)",
-    "url": "https://www.eba.europa.eu/news-press/news/rss.xml",
-   },
+        "regulator": "eba",
+        "name": "EBA (DORA & prudential)",
+        "url": "https://www.eba.europa.eu/news-press/news/rss.xml",
+    },
 ]
 
-# Haiku system prompt for regulatory item scoring
+# Score threshold for full document fetching
+DEEP_FETCH_THRESHOLD = 7
+
+# Haiku system prompt for initial scoring
 TRIAGE_SYSTEM_PROMPT = """You are a regulatory intelligence analyst for UK financial services firms.
 
 Your task is to evaluate regulatory publications and score their relevance and urgency for regulated firms.
@@ -100,6 +105,24 @@ Response format (JSON only):
   "ai_commentary": "<2-3 sentences: what this means for a typical IFA or wealth manager>"
 }"""
 
+# Haiku prompt for deep document extraction
+DEEP_EXTRACT_PROMPT = """You are extracting structured intelligence from a regulatory document.
+
+Extract the following if present. Respond with JSON only, no markdown fences.
+
+{
+  "fine_amount": "<amount if enforcement action, else null>",
+  "individual_named": "<name if individual enforcement, else null>",
+  "consultation_deadline": "<ISO date if consultation, else null>",
+  "implementation_date": "<ISO date if implementation deadline, else null>",
+  "rule_references": ["<rulebook/regulation references>"],
+  "key_facts": ["<3-5 most important factual points>"],
+  "firm_types_affected": ["<firm types explicitly mentioned>"],
+  "enhanced_commentary": "<3-4 sentences of detailed analysis for an IFA or wealth manager>"
+}
+
+Document:
+{content}"""
 
 # Firm profile matching prompt
 FIRM_PROFILE_PROMPT = """You are scoring a regulatory item for relevance to a specific financial services firm.
@@ -140,7 +163,7 @@ def run(config: Config) -> dict:
             logger.info(
                 f"  {feed['name']}: {result['new']} new, {result['duplicates']} duplicates"
             )
-            time.sleep(1)  # polite pause between feeds
+            time.sleep(1)
 
         summary = {
             "feeds_scanned": len(REGULATORY_FEEDS),
@@ -170,7 +193,7 @@ def _process_feed(feed: dict, clients: list, claude: anthropic.Anthropic, config
         logger.error(f"Failed to fetch {feed['name']}: {e}")
         return {"regulator": regulator, "new": 0, "duplicates": 0, "error": str(e)}
 
-    for entry in parsed.entries[:10]:  # cap at 20 per feed per run
+    for entry in parsed.entries[:10]:
         title = entry.get("title", "").strip()
         link = entry.get("link", "").strip()
         summary = entry.get("summary", entry.get("description", "")).strip()
@@ -185,13 +208,25 @@ def _process_feed(feed: dict, clients: list, claude: anthropic.Anthropic, config
             duplicate_count += 1
             continue
 
-        # Score with Claude Haiku
+        # Step 1: Initial scoring with Haiku
         scores = _score_item(title, summary, regulator, claude, config)
-
         if not scores:
             continue
 
-        # Store the item
+        # Step 2: Deep document fetch for high-scoring items
+        deep_data = None
+        if scores.get("relevance_score", 0) >= DEEP_FETCH_THRESHOLD:
+            logger.info(f"  Deep fetching [{scores['relevance_score']}/10]: {title[:60]}")
+            full_text = _fetch_document(link)
+            if full_text:
+                deep_data = _extract_deep_intelligence(full_text, claude, config)
+                if deep_data:
+                    # Enrich scores with deep extraction
+                    if deep_data.get("enhanced_commentary"):
+                        scores["ai_commentary"] = deep_data["enhanced_commentary"]
+                    time.sleep(1.5)
+
+        # Step 3: Store the item
         item_id = _store_item(
             regulator=regulator,
             title=title,
@@ -200,19 +235,93 @@ def _process_feed(feed: dict, clients: list, claude: anthropic.Anthropic, config
             published_at=published_at,
             content_hash=content_hash,
             scores=scores,
+            deep_data=deep_data,
             model_used=config.model_triage,
         )
 
-        # Score against each client's firm profile
+        # Step 4: Score against each client's firm profile
         if item_id and clients and scores.get("relevance_score", 0) >= 5:
+            # Use enriched summary for firm scoring if available
+            scoring_summary = (
+                deep_data.get("enhanced_commentary", summary)
+                if deep_data else summary
+            )
             for client in clients:
-                _score_for_client(item_id, client, title, summary, regulator, scores, claude, config)
-                time.sleep(0.3)
+                _score_for_client(item_id, client, title, scoring_summary, regulator, scores, claude, config)
+                time.sleep(0.5)
 
         new_count += 1
-        time.sleep(1.5)  # pace Claude API calls
+        time.sleep(1.5)
 
     return {"regulator": regulator, "new": new_count, "duplicates": duplicate_count}
+
+
+def _fetch_document(url: str) -> str | None:
+    """
+    Fetch the full text of a regulatory document.
+    Returns cleaned text suitable for passing to Claude.
+    Caps at ~3000 words to stay within token limits.
+    """
+    try:
+        response = requests.get(
+            url,
+            headers={
+                "User-Agent": "Mozilla/5.0 (compatible; TryggLex/1.0; regulatory research)",
+                "Accept": "text/html,application/xhtml+xml",
+            },
+            timeout=15,
+        )
+        response.raise_for_status()
+
+        # Basic HTML stripping — remove tags, collapse whitespace
+        import re
+        text = response.text
+
+        # Remove script and style blocks
+        text = re.sub(r'<(script|style)[^>]*>.*?</(script|style)>', '', text, flags=re.DOTALL | re.IGNORECASE)
+        # Remove HTML tags
+        text = re.sub(r'<[^>]+>', ' ', text)
+        # Decode HTML entities
+        text = text.replace('&amp;', '&').replace('&lt;', '<').replace('&gt;', '>').replace('&nbsp;', ' ').replace('&#39;', "'").replace('&quot;', '"')
+        # Collapse whitespace
+        text = re.sub(r'\s+', ' ', text).strip()
+
+        # Cap at ~3000 words (roughly 4000 tokens)
+        words = text.split()
+        if len(words) > 3000:
+            text = ' '.join(words[:3000]) + '...'
+
+        return text if len(text) > 100 else None
+
+    except requests.exceptions.Timeout:
+        logger.warning(f"Document fetch timed out: {url}")
+        return None
+    except requests.exceptions.RequestException as e:
+        logger.warning(f"Document fetch failed for {url}: {e}")
+        return None
+
+
+def _extract_deep_intelligence(full_text: str, claude: anthropic.Anthropic, config: Config) -> dict | None:
+    """
+    Use Haiku to extract structured intelligence from a full document.
+    Returns enriched data including fine amounts, deadlines, rule references.
+    """
+    prompt = DEEP_EXTRACT_PROMPT.replace("{content}", full_text[:4000])
+
+    try:
+        response = claude.messages.create(
+            model=config.model_triage,
+            max_tokens=500,
+            messages=[{"role": "user", "content": prompt}],
+        )
+        raw = response.content[0].text.strip()
+        if raw.startswith("```"):
+            raw = raw.split("\n", 1)[1].rsplit("```", 1)[0]
+        return json.loads(raw.strip())
+
+    except (json.JSONDecodeError, anthropic.APIError) as e:
+        logger.warning(f"Deep extraction failed: {e}")
+        return None
 
 
 def _score_item(title: str, summary: str, regulator: str, claude: anthropic.Anthropic, config: Config) -> dict | None:
@@ -233,11 +342,8 @@ def _score_item(title: str, summary: str, regulator: str, claude: anthropic.Anth
             messages=[{"role": "user", "content": f"Score this regulatory item:\n\n{content}"}],
         )
         raw = response.content[0].text.strip()
-
-        # Strip markdown fences if present
         if raw.startswith("```"):
             raw = raw.split("\n", 1)[1].rsplit("```", 1)[0]
-
         return json.loads(raw.strip())
 
     except (json.JSONDecodeError, anthropic.APIError) as e:
@@ -279,7 +385,6 @@ def _score_for_client(
             raw = raw.split("\n", 1)[1].rsplit("```", 1)[0]
 
         result = json.loads(raw.strip())
-
         _store_client_score(
             item_id=item_id,
             client_id=client["id"],
@@ -311,9 +416,23 @@ def _store_item(
     published_at: datetime | None,
     content_hash: str,
     scores: dict,
+    deep_data: dict | None,
     model_used: str,
 ) -> str | None:
     item_id = str(uuid.uuid4())
+
+    # Merge deep extraction data into metadata
+    metadata = {}
+    if deep_data:
+        metadata["fine_amount"] = deep_data.get("fine_amount")
+        metadata["individual_named"] = deep_data.get("individual_named")
+        metadata["consultation_deadline"] = deep_data.get("consultation_deadline")
+        metadata["implementation_date"] = deep_data.get("implementation_date")
+        metadata["rule_references"] = deep_data.get("rule_references", [])
+        metadata["key_facts"] = deep_data.get("key_facts", [])
+        metadata["firm_types_affected"] = deep_data.get("firm_types_affected", [])
+        metadata["deep_fetch"] = True
+
     try:
         with get_conn() as conn:
             with conn.cursor() as cur:
@@ -323,13 +442,13 @@ def _store_item(
                         source_url, published_at, discovered_at,
                         relevance_score, urgency, action_required,
                         impact_areas, ai_commentary, model_used, scored_at,
-                        content_hash
+                        content_hash, metadata
                     ) VALUES (
                         %s, %s, 'other', %s, %s,
                         %s, %s, NOW(),
                         %s, %s, %s,
                         %s, %s, %s, NOW(),
-                        %s
+                        %s, %s
                     )
                 """, (
                     item_id, regulator, title, summary,
@@ -341,6 +460,7 @@ def _store_item(
                     scores.get("ai_commentary"),
                     model_used,
                     content_hash,
+                    json.dumps(metadata) if metadata else None,
                 ))
         return item_id
     except Exception as e:
@@ -362,7 +482,6 @@ def _store_client_score(item_id: str, client_id: str, firm_relevance_score: int,
 
 
 def _get_active_clients_with_profiles() -> list[dict]:
-    """Return all active clients that have a firm profile configured."""
     with get_conn() as conn:
         with conn.cursor() as cur:
             cur.execute("""
