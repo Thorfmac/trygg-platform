@@ -13,9 +13,9 @@
 #
 # Feed sources:
 #   FCA  — https://www.fca.org.uk/rss.xml (news + warnings)
-#   PRA  — https://www.bankofengland.co.uk/rss/prudential-regulation
+#   PRA  — https://www.bankofengland.co.uk/rss/news
 #   ESMA — https://www.esma.europa.eu/press-news/esma-news/rss.xml
-#   ICO  — https://ico.org.uk/about-the-ico/media-centre/news-and-blogs/rss/
+#   ICO  — https://ico.org.uk/about-the-ico/what-we-do/our-work-programme/project-updates/rss/
 #   EBA  — https://www.eba.europa.eu/rss/latest-news (covers DORA)
 #
 # This agent runs once daily at 08:00 UTC via the scheduler.
@@ -48,7 +48,7 @@ REGULATORY_FEEDS = [
     {
         "regulator": "pra",
         "name": "PRA / Bank of England",
-        "url": "https://www.bankofengland.co.uk/rss/prudential-regulation",
+        "url": "https://www.bankofengland.co.uk/rss/news",
     },
     {
         "regulator": "esma",
@@ -56,15 +56,15 @@ REGULATORY_FEEDS = [
         "url": "https://www.esma.europa.eu/press-news/esma-news/rss.xml",
     },
     {
-        "regulator": "ico",
-        "name": "ICO",
-        "url": "https://ico.org.uk/about-the-ico/media-centre/news-and-blogs/rss/",
+    "regulator": "fca_enforcement",
+    "name": "FCA Enforcement & Warnings",
+    "url": "https://www.fca.org.uk/news/rss.xml",
     },
     {
-        "regulator": "bis",
-        "name": "EBA (DORA & prudential)",
-        "url": "https://www.eba.europa.eu/rss/latest-news",
-    },
+    "regulator": "eba",
+    "name": "EBA (DORA & prudential)",
+    "url": "https://www.eba.europa.eu/news-press/news/rss.xml",
+   },
 ]
 
 # Haiku system prompt for regulatory item scoring
@@ -170,7 +170,7 @@ def _process_feed(feed: dict, clients: list, claude: anthropic.Anthropic, config
         logger.error(f"Failed to fetch {feed['name']}: {e}")
         return {"regulator": regulator, "new": 0, "duplicates": 0, "error": str(e)}
 
-    for entry in parsed.entries[:20]:  # cap at 20 per feed per run
+    for entry in parsed.entries[:10]:  # cap at 20 per feed per run
         title = entry.get("title", "").strip()
         link = entry.get("link", "").strip()
         summary = entry.get("summary", entry.get("description", "")).strip()
@@ -210,7 +210,7 @@ def _process_feed(feed: dict, clients: list, claude: anthropic.Anthropic, config
                 time.sleep(0.3)
 
         new_count += 1
-        time.sleep(0.5)  # pace Claude API calls
+        time.sleep(1.5)  # pace Claude API calls
 
     return {"regulator": regulator, "new": new_count, "duplicates": duplicate_count}
 
