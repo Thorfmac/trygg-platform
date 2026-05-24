@@ -161,13 +161,13 @@ def _build_search_query(company: dict) -> str:
 
     overrides = {
         "pqshield":          "PQShield quantum cryptography",
-        "isara":             "ISARA Corporation quantum cryptography",
-        "crypto4a":          "Crypto4A quantum HSM",
-        "evolutionq":        "evolutionQ quantum cryptography",
-        "crypto-quantique":  "Crypto Quantique IoT security",
-        "xiphera":           "Xiphera quantum cryptography FPGA",
-        "sealsq":            "SEALSQ quantum semiconductor",
-        "quantinuum":        "Quantinuum quantum computing",
+        "isara":             "ISARA quantum cryptography standards",
+        "crypto4a":          "quantum cryptography hardware security module",
+        "evolutionq":        "quantum cryptography network security",
+        "crypto-quantique":  "quantum IoT security semiconductor",
+        "xiphera":           "FPGA cryptography hardware security",
+        "sealsq":            "SEALSQ quantum semiconductor LAES",
+        "quantinuum":        "Quantinuum quantum computing IPO",
     }
 
     if slug in overrides:
