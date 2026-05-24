@@ -126,6 +126,10 @@ async def snapshot_equity(
         revenue_ttm    = income_data[0].get("revenue")
         yoy_growth_pct = calculate_yoy_growth(income_data)
 
+    # Calculate P/S from market_cap / revenue_ttm if API did not return it
+    if not ps_ratio and market_cap and revenue_ttm and revenue_ttm > 0:
+        ps_ratio = round(market_cap / revenue_ttm, 2)
+
     # Build raw data blob
     raw_data = {
         "quote":   quote_data,
