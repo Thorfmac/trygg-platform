@@ -278,3 +278,127 @@ async def handle_ares_command(command: str, args: str, pool: asyncpg.Pool) -> st
             "/ares_candidates — watchlist candidates\n"
             "/ares_thesis — deep analysis (Phase 4)"
         )
+
+
+# ------------------------------------------------------------
+# /ares_approve <id> — Approve a trade proposal
+# /ares_approve_all  — Approve all pending proposals
+# /ares_reject <id>  — Reject a trade proposal
+# /ares_positions    — Show current open positions
+# /ares_halt         — Emergency halt — cancel all pending proposals
+# ------------------------------------------------------------
+
+async def cmd_ares_approve(pool: asyncpg.Pool, proposal_id: str) -> str:
+    """Approve a specific trade proposal."""
+    try:
+        pid = int(proposal_id.strip())
+    except ValueError:
+        return f"Invalid proposal ID: {proposal_id}. Use /ares_approve <number>"
+
+    async with pool.acquire() as conn:
+        proposal = await conn.fetchrow("""
+            UPDATE ares.trade_proposals
+            SET status = 'approved', approved_at = NOW()
+            WHERE id = $1 AND status = 'pending' AND proposal_date = CURRENT_DATE
+            RETURNING ticker, quantity, price_usd, position_gbp
+        """, pid)
+
+    if not proposal:
+        return f"Proposal #{pid} not found or already actioned."
+
+    return (
+        f"APPROVED — Proposal #{pid}\n"
+        f"BUY {proposal['quantity']} {proposal['ticker']} "
+        f"@ ~${proposal['price_usd']:.2f} (£{proposal['position_gbp']:.2f})\n"
+        f"Will execute at US market open (14:30 UTC)."
+    )
+
+
+async def cmd_ares_approve_all(pool: asyncpg.Pool) -> str:
+    """Approve all pending proposals for today."""
+    async with pool.acquire() as conn:
+        count = await conn.fetchval("""
+            WITH updated AS (
+                UPDATE ares.trade_proposals
+                SET status = 'approved', approved_at = NOW()
+                WHERE status = 'pending' AND proposal_date = CURRENT_DATE
+                RETURNING id
+            ) SELECT COUNT(*) FROM updated
+        """)
+
+    if count == 0:
+        return "No pending proposals to approve today."
+
+    return (
+        f"ALL APPROVED — {count} proposal(s) approved.\n"
+        f"Will execute at US market open (14:30 UTC)."
+    )
+
+
+async def cmd_ares_reject(pool: asyncpg.Pool, proposal_id: str) -> str:
+    """Reject a specific trade proposal."""
+    try:
+        pid = int(proposal_id.strip())
+    except ValueError:
+        return f"Invalid proposal ID: {proposal_id}. Use /ares_reject <number>"
+
+    async with pool.acquire() as conn:
+        proposal = await conn.fetchrow("""
+            UPDATE ares.trade_proposals
+            SET status = 'rejected', rejected_at = NOW()
+            WHERE id = $1 AND status = 'pending' AND proposal_date = CURRENT_DATE
+            RETURNING ticker, quantity
+        """, pid)
+
+    if not proposal:
+        return f"Proposal #{pid} not found or already actioned."
+
+    return f"REJECTED — Proposal #{pid}: {proposal['quantity']} {proposal['ticker']}"
+
+
+async def cmd_ares_halt(pool: asyncpg.Pool) -> str:
+    """Emergency halt — reject all pending proposals."""
+    async with pool.acquire() as conn:
+        count = await conn.fetchval("""
+            WITH updated AS (
+                UPDATE ares.trade_proposals
+                SET status = 'rejected', rejected_at = NOW()
+                WHERE status IN ('pending', 'approved')
+                  AND proposal_date = CURRENT_DATE
+                RETURNING id
+            ) SELECT COUNT(*) FROM updated
+        """)
+
+    return (
+        f"HALT EXECUTED — {count} proposal(s) cancelled.\n"
+        "No trades will execute today."
+    )
+
+
+async def cmd_ares_positions(pool: asyncpg.Pool) -> str:
+    """Show today's executed trades."""
+    async with pool.acquire() as conn:
+        trades = await conn.fetch("""
+            SELECT ticker, quantity, fill_price, fill_quantity,
+                   position_gbp, status, executed_at, order_id
+            FROM ares.trade_proposals
+            WHERE proposal_date = CURRENT_DATE
+              AND status IN ('executed', 'submitted', 'approved', 'failed')
+            ORDER BY executed_at DESC NULLS LAST
+        """)
+
+    if not trades:
+        return "ARES POSITIONS\n\nNo trades executed today."
+
+    lines = [f"ARES POSITIONS — {date.today()}", ""]
+    for t in trades:
+        fill_str = (
+            f"{t['fill_quantity']} @ ${t['fill_price']:.2f}"
+            if t["fill_price"] else "pending"
+        )
+        lines.append(
+            f"{t['ticker']}: {t['status'].upper()} — "
+            f"{fill_str} [#{t['order_id']}]"
+        )
+
+    return "\n".join(lines)
