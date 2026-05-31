@@ -4,17 +4,19 @@
 # Install everything with:
 #   pip install -r requirements.txt
 
-# Database
-psycopg2-binary==2.9.9          # PostgreSQL driver
+# Database — synchronous (Mímir, Lex) and async (Ares)
+psycopg2-binary==2.9.9          # PostgreSQL driver (sync — used by Mímir/Lex)
+asyncpg==0.29.0                 # PostgreSQL driver (async — used by Ares agents)
+
+# HTTP — synchronous (Mímir, Lex) and async (Ares)
+requests==2.32.3                # HTTP client (sync — used by Mímir/Lex)
+aiohttp==3.9.5                  # HTTP client (async — used by Ares agents)
 
 # Claude API
 anthropic==0.40.0               # Anthropic Python SDK
 
 # Scheduler
 APScheduler==3.10.4             # Job scheduler
-
-# HTTP requests (for NewsAPI and Ollama)
-requests==2.32.3
 
 # Environment variables
 python-dotenv==1.0.1
@@ -24,4 +26,4 @@ python-telegram-bot==21.6
 
 # Utilities
 python-dateutil==2.9.0          # Robust date parsing
-feedparser
+feedparser                       # RSS/Atom feed parsing (Lex)

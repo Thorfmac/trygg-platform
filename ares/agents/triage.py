@@ -1,15 +1,31 @@
 """
 Trygg Ares — Triage Agent
-Scores untriaged signals using Claude Haiku 4.5.
-Three-dimension scoring: relevance, narrative (SpaceX read-through), valuation flag.
+=========================
 
-Schedule: 06:30 UTC daily (after feed ingestion)
+Scores untriaged signals from ares.signals using Claude Haiku 4.5.
+
+Discipline applied per Source-Authority Spec v1:
+- source_tier classified into 1-4 (primary regulatory → social/AI)
+- authority_tier set after corroboration logic
+- is_recency_critical flagged for adverse events
+- Tier 4 cap: Class A claims from Tier 4 alone capped at relevance 4
+
+Discipline applied per Ares Universe Doc v5:
+- relevance_score for name-specific impact (1-10)
+- narrative_score for cross-position read-through (1-10)
+- Awareness of SpaceX-IPO and quantum-correlated clusters
+
+Reads the system prompt from triage_prompt.md (sibling file) so the prompt
+can be edited independently of the agent code.
+
+Schedule via scheduler.py — typically 30 minutes after feed ingestion runs.
 """
 
 import asyncio
 import json
 import logging
 import os
+from pathlib import Path
 from typing import Optional
 
 import anthropic
@@ -20,253 +36,251 @@ load_dotenv()
 
 logger = logging.getLogger(__name__)
 
-DATABASE_URL      = os.getenv("DATABASE_URL")
+# -----------------------------------------------------------------------------
+# Configuration
+# -----------------------------------------------------------------------------
+
+DATABASE_URL = os.getenv("DATABASE_URL")
 ANTHROPIC_API_KEY = os.getenv("ANTHROPIC_API_KEY")
 
-# Model
 TRIAGE_MODEL = "claude-haiku-4-5-20251001"
+BATCH_SIZE = 20            # Signals scored per run
+MAX_BODY_CHARS = 8000      # Truncate signal body to keep prompts efficient
+MAX_OUTPUT_TOKENS = 512    # Triage output is small JSON; cap to control cost
 
-# Only score signals above this relevance threshold in digest
-MIN_DIGEST_SCORE = 5
+# Load system prompt from external markdown file
+PROMPT_PATH = Path(__file__).parent / "triage_prompt.md"
+if not PROMPT_PATH.exists():
+    raise FileNotFoundError(
+        f"Triage prompt not found at {PROMPT_PATH}. "
+        "The prompt is a required dependency."
+    )
+SYSTEM_PROMPT = PROMPT_PATH.read_text(encoding="utf-8")
 
-# Cached system prompt — reduces cost ~90% on repeated calls
-SYSTEM_PROMPT = """You are Trygg Ares, an equity intelligence agent specialising in the second and third order market effects of the SpaceX IPO.
-
-Your task is to score news signals for their relevance to the SpaceX IPO read-through thesis.
-
-Score each signal on exactly these four dimensions:
-
-relevance_score (integer 1-10):
-  Does this signal genuinely concern this specific company?
-  10 = directly about this company's core business
-  1  = tangential mention or unrelated
-
-narrative_score (integer 1-10):
-  How strongly does this signal relate to the SpaceX IPO re-rating thesis?
-  10 = direct SpaceX comparison, sector re-rating language, IPO benchmark discussion
-  7-9 = clear adjacency, institutional capital flows, sector positioning
-  4-6 = indirect connection, supply chain, macro space tailwind
-  1-3 = tangential or no connection to SpaceX thesis
-
-sentiment (string):
-  One of: Strongly Positive, Positive, Neutral, Negative, Strongly Negative
-
-valuation_flag (string):
-  Given the P/S ratio vs sector context provided, classify as one of:
-  undervalued    = P/S significantly below peers AND narrative_score >= 6
-  fairly_valued  = P/S in line with peers
-  overvalued     = P/S significantly above peers
-  insufficient_data = no financial data available to assess
-
-implication (string):
-  One sentence only. What does this signal mean for the SpaceX IPO thesis and this equity's positioning?
-  Be specific. Avoid generic statements.
-
-Return ONLY valid JSON with these exact keys. No markdown fences. No preamble."""
+REQUIRED_FIELDS = {
+    "source_tier", "authority_tier", "is_recency_critical",
+    "relevance_score", "sentiment", "implication",
+    "narrative_score", "narrative_notes",
+}
 
 
-def build_user_prompt(signal: dict, equity: dict, snapshot: Optional[dict]) -> str:
-    """Build the triage prompt for a single signal."""
+# -----------------------------------------------------------------------------
+# Triage a single signal
+# -----------------------------------------------------------------------------
 
-    # Valuation context
-    if snapshot:
-        ps_ratio    = snapshot.get("ps_ratio")
-        revenue_ttm = snapshot.get("revenue_ttm")
-        price       = snapshot.get("price")
-        val_context = (
-            f"Current price: ${price}\n"
-            f"Revenue TTM: ${revenue_ttm:,}\n"
-            f"P/S ratio: {ps_ratio if ps_ratio else 'not available'}"
-        ) if revenue_ttm else "Financial data: not available"
-    else:
-        val_context = "Financial data: not available"
-
-    return f"""Company: {equity['name']} ({equity['ticker']})
-Sector: {equity['sector_name']} (Order {equity['order_level']} effect)
-Thesis: {equity['thesis_note']}
-
-{val_context}
-
-Signal title: {signal['title']}
-Signal source: {signal['source'] or 'unknown'}
-
-Score this signal for the Trygg Ares SpaceX IPO thesis."""
-
-
-def parse_triage_response(response_text: str) -> Optional[dict]:
-    """Parse Claude's JSON response, stripping any markdown fences."""
-    text = response_text.strip()
-    # Strip markdown fences if present
-    if text.startswith("```"):
-        lines = text.split("\n")
-        text = "\n".join(lines[1:-1] if lines[-1] == "```" else lines[1:])
-    try:
-        return json.loads(text)
-    except json.JSONDecodeError as e:
-        logger.error(f"JSON parse error: {e} — response was: {text[:200]}")
-        return None
-
-
-async def triage_signal(
-    client: anthropic.Anthropic,
+async def triage_one_signal(
+    client: anthropic.AsyncAnthropic,
     signal: dict,
-    equity: dict,
-    snapshot: Optional[dict],
 ) -> Optional[dict]:
-    """Score a single signal with Claude Haiku. Returns parsed scores or None."""
+    """Score one signal. Returns dict of fields to update, or None on failure."""
+
+    body_excerpt = (signal.get("body") or "")[:MAX_BODY_CHARS]
+    user_message = (
+        f"Entity: {signal['ticker']} ({signal['entity_name']})\n"
+        f"Source: {signal['source']}\n"
+        f"URL: {signal.get('url') or 'n/a'}\n"
+        f"Published: {signal.get('published_at') or 'n/a'}\n"
+        f"Headline: {signal['headline']}\n\n"
+        f"Body excerpt:\n{body_excerpt}"
+    )
+
     try:
-        response = client.messages.create(
+        response = await client.messages.create(
             model=TRIAGE_MODEL,
-            max_tokens=300,
+            max_tokens=MAX_OUTPUT_TOKENS,
             system=[
                 {
                     "type": "text",
                     "text": SYSTEM_PROMPT,
-                    "cache_control": {"type": "ephemeral"},  # Prompt caching
+                    "cache_control": {"type": "ephemeral"},
                 }
             ],
-            messages=[
-                {
-                    "role": "user",
-                    "content": build_user_prompt(signal, equity, snapshot),
-                }
-            ],
+            messages=[{"role": "user", "content": user_message}],
         )
-        return parse_triage_response(response.content[0].text)
-    except Exception as e:
-        logger.error(f"Triage API error for signal {signal['id']}: {e}")
+    except anthropic.APIError as e:
+        logger.error("API error for signal %s: %s", signal["id"], e)
         return None
 
+    raw = response.content[0].text.strip()
+
+    # Strip markdown fences if the model includes them despite instructions
+    if raw.startswith("```"):
+        parts = raw.split("```")
+        if len(parts) >= 2:
+            raw = parts[1]
+            if raw.startswith("json"):
+                raw = raw[4:]
+            raw = raw.strip()
+
+    try:
+        parsed = json.loads(raw)
+    except json.JSONDecodeError as e:
+        logger.error(
+            "JSON parse failed for signal %s: %s\nRaw output: %s",
+            signal["id"], e, raw[:300]
+        )
+        return None
+
+    missing = REQUIRED_FIELDS - set(parsed.keys())
+    if missing:
+        logger.error(
+            "Signal %s missing required fields: %s",
+            signal["id"], missing
+        )
+        return None
+
+    # Apply Tier 4 cap defensively (the prompt asks for this, but enforce here too)
+    if parsed["source_tier"] == 4 and parsed["relevance_score"] > 4:
+        logger.info(
+            "Applied Tier 4 cap to signal %s (was %d → 4)",
+            signal["id"], parsed["relevance_score"]
+        )
+        parsed["relevance_score"] = 4
+
+    return parsed
+
+
+# -----------------------------------------------------------------------------
+# Main triage loop
+# -----------------------------------------------------------------------------
 
 async def run_triage():
-    """Main entry point — triage all unscored signals."""
+    """Pull untriaged signals, score with Haiku, write results back."""
+
     if not ANTHROPIC_API_KEY:
-        logger.error("ANTHROPIC_API_KEY not set — aborting")
+        logger.error("ANTHROPIC_API_KEY not set in .env — aborting")
+        return
+    if not DATABASE_URL:
+        logger.error("DATABASE_URL not set in .env — aborting")
         return
 
+    client = anthropic.AsyncAnthropic(api_key=ANTHROPIC_API_KEY)
     pool = await asyncpg.create_pool(DATABASE_URL, min_size=2, max_size=5)
-    client = anthropic.Anthropic(api_key=ANTHROPIC_API_KEY)
 
-    # Fetch untriaged signals with equity and snapshot context
+    # Open a job_run row for audit logging
+    # NOTE: assumes platform.job_runs has (job_name, started_at, completed_at,
+    # status, records_processed) columns. Verify against your existing schema.
+    try:
+        async with pool.acquire() as conn:
+            job_run_id = await conn.fetchval("""
+                INSERT INTO platform.job_runs (job_name, job_module, started_at, status)
+VALUES ('ares_triage', 'ares.agents.triage', NOW(), 'running')
+                RETURNING id
+            """)
+    except asyncpg.PostgresError as e:
+        logger.warning(
+            "Could not insert job_run row (platform.job_runs schema may differ): %s. "
+            "Continuing without audit row.",
+            e
+        )
+        job_run_id = None
+
+    # Pull untriaged signals (those with NULL relevance_score)
     async with pool.acquire() as conn:
         signals = await conn.fetch("""
             SELECT
-                sig.id,
-                sig.title,
-                sig.url,
-                sig.source,
-                sig.equity_id,
-                e.name        AS equity_name,
-                e.ticker,
-                e.thesis_note,
-                s.name        AS sector_name,
-                s.order_level,
-                snap.price,
-                snap.ps_ratio,
-                snap.revenue_ttm
-            FROM ares.signals sig
-            JOIN ares.equities e  ON e.id  = sig.equity_id
-            JOIN ares.sectors  s  ON s.id  = e.sector_id
-            LEFT JOIN ares.equity_snapshots snap
-                ON snap.equity_id = sig.equity_id
-                AND snap.snapshot_date = CURRENT_DATE
-            WHERE sig.relevance_score IS NULL
-            ORDER BY sig.created_at DESC
-            LIMIT 50
-        """)
+                s.id, s.headline, s.url, s.source, s.body,
+                s.published_at, s.entity_id,
+                e.ticker, e.name AS entity_name
+            FROM ares.signals s
+            JOIN ares.entities e ON e.id = s.entity_id
+            WHERE s.relevance_score IS NULL
+            ORDER BY s.fetched_at ASC
+            LIMIT $1
+        """, BATCH_SIZE)
 
     if not signals:
-        logger.info("No untriaged signals found")
-        await pool.close()
-        return
-
-    logger.info(f"Triaging {len(signals)} signals with {TRIAGE_MODEL}...")
-
-    scored   = 0
-    failed   = 0
-    high_scores = []
-
-    for signal in signals:
-        sig_dict    = dict(signal)
-        equity_dict = {
-            "name":        sig_dict["equity_name"],
-            "ticker":      sig_dict["ticker"],
-            "thesis_note": sig_dict["thesis_note"],
-            "sector_name": sig_dict["sector_name"],
-            "order_level": sig_dict["order_level"],
-        }
-        snapshot_dict = {
-            "price":       sig_dict["price"],
-            "ps_ratio":    sig_dict["ps_ratio"],
-            "revenue_ttm": sig_dict["revenue_ttm"],
-        } if sig_dict["price"] else None
-
-        scores = await triage_signal(client, sig_dict, equity_dict, snapshot_dict)
-
-        if scores:
-            relevance_score = scores.get("relevance_score")
-            narrative_score = scores.get("narrative_score")
-            sentiment       = scores.get("sentiment")
-            valuation_flag  = scores.get("valuation_flag")
-            implication     = scores.get("implication")
-
-            # Validate valuation_flag
-            valid_flags = {"undervalued", "fairly_valued", "overvalued", "insufficient_data"}
-            if valuation_flag not in valid_flags:
-                valuation_flag = "insufficient_data"
-
+        logger.info("No untriaged signals — nothing to do")
+        if job_run_id is not None:
             async with pool.acquire() as conn:
                 await conn.execute("""
-                    UPDATE ares.signals SET
-                        relevance_score = $1,
-                        narrative_score = $2,
-                        sentiment       = $3,
-                        valuation_flag  = $4,
-                        implication     = $5,
-                        triaged_at      = NOW()
-                    WHERE id = $6
-                """,
-                    relevance_score,
-                    narrative_score,
-                    sentiment,
-                    valuation_flag,
-                    implication,
-                    sig_dict["id"],
-                )
+                    UPDATE platform.job_runs
+                    SET completed_at = NOW(),
+                        status = 'completed',
+                        records_processed = 0
+                    WHERE id = $1
+                """, job_run_id)
+        await pool.close()
+        await client.close()
+        return
 
-            scored += 1
+    logger.info("Triaging %d signals...", len(signals))
 
-            # Track high-scoring signals for immediate alert consideration
-            if narrative_score and narrative_score >= 9:
-                high_scores.append({
-                    "ticker":     sig_dict["ticker"],
-                    "title":      sig_dict["title"],
-                    "narrative":  narrative_score,
-                    "relevance":  relevance_score,
-                    "implication": implication,
-                })
+    scored = 0
+    failed = 0
+    recency_critical_count = 0
 
-            logger.info(
-                f"  {sig_dict['ticker']}: rel={relevance_score}, "
-                f"narr={narrative_score}, {sentiment}, {valuation_flag}"
-            )
-        else:
+    for signal in signals:
+        result = await triage_one_signal(client, dict(signal))
+
+        if result is None:
             failed += 1
+            continue
 
-        # Small delay to avoid rate limiting
-        await asyncio.sleep(0.3)
+        # Write back to database
+        async with pool.acquire() as conn:
+            await conn.execute("""
+                UPDATE ares.signals SET
+                    source_tier         = $1,
+                    authority_tier      = $2,
+                    is_recency_critical = $3,
+                    relevance_score     = $4,
+                    sentiment           = $5,
+                    implication         = $6,
+                    narrative_score     = $7,
+                    narrative_notes     = $8,
+                    triage_model        = $9,
+                    triage_run_id       = $10
+                WHERE id = $11
+            """,
+                result["source_tier"],
+                result["authority_tier"],
+                result["is_recency_critical"],
+                result["relevance_score"],
+                result["sentiment"],
+                result["implication"],
+                result["narrative_score"],
+                result["narrative_notes"],
+                TRIAGE_MODEL,
+                job_run_id,
+                signal["id"],
+            )
 
-    # Log any landmark signals
-    if high_scores:
-        logger.warning(f"HIGH NARRATIVE SIGNALS (>=9): {len(high_scores)}")
-        for hs in high_scores:
+        scored += 1
+        if result["is_recency_critical"]:
+            recency_critical_count += 1
             logger.warning(
-                f"  *** {hs['ticker']} narr={hs['narrative']} — {hs['title'][:80]}"
+                "RECENCY-CRITICAL: signal %d (%s) — %s",
+                signal["id"], signal["ticker"], signal["headline"]
+            )
+
+    # Close the job_run audit row
+    if job_run_id is not None:
+        async with pool.acquire() as conn:
+            await conn.execute("""
+                UPDATE platform.job_runs
+                SET completed_at = NOW(),
+                    status = $1,
+                    records_processed = $2
+                WHERE id = $3
+            """,
+                "completed" if failed == 0 else "completed_with_errors",
+                scored,
+                job_run_id,
             )
 
     await pool.close()
-    logger.info(f"Triage complete — {scored} scored, {failed} failed")
+    await client.close()
 
+    logger.info(
+        "Triage complete — %d scored, %d failed, %d recency-critical flagged",
+        scored, failed, recency_critical_count
+    )
+
+
+# -----------------------------------------------------------------------------
+# Entry point
+# -----------------------------------------------------------------------------
 
 if __name__ == "__main__":
     logging.basicConfig(
