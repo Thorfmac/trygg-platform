@@ -16,22 +16,31 @@
 #   which crashed the scheduler with ModuleNotFoundError when aiohttp
 #   wasn't installed. Don't go back to top-level Ares imports.
 #
-# CURRENTLY WIRED AGENTS:
-#   Mímir: feed_ingestion, triage, daily_digest  (sync)
-#   Lex:   ingestion, digest                      (sync)
-#   Ares:  triage                                 (async — only one built)
+# CURRENTLY WIRED AGENTS (revised 5 June 2026):
+#   Mímir: feed_ingestion, triage, daily_digest      (sync)
+#   Lex:   ingestion, digest                          (sync)
+#   Ares:  feed_ingestion, triage, verifier,          (async)
+#          digest_morning, digest_midday, digest_postclose
 #
-# COMMENTED OUT (not yet built or being rebuilt):
-#   Ares: feed_ingestion, financial_snapshot, digest, deep_analysis,
+# COMMENTED OUT (not yet built):
+#   Ares: financial_snapshot, deep_analysis,
 #         trade_proposal, execution
 #
 # Job schedule:
+#   ── UTC anchored (UK-relevant) ──────────────────────────────
 #   Every 6 hours        — Mímir feed ingestion (00, 06, 12, 18 UTC)
 #   Every 6 hours :30    — Mímir triage
+#   3x daily             — Ares feed ingestion (05, 12, 19 UTC)
+#   3x daily             — Ares triage         (05:30, 12:15, 19:15 UTC)
 #   Every day 07:00 UTC  — Mímir daily digest
+#   Every day 07:15 UTC  — Ares morning digest
+#   Every day 07:30 UTC  — Ares verifier
 #   Every day 08:00 UTC  — Lex regulatory ingestion
 #   Every day 08:30 UTC  — Lex digest
-#   Every day 06:45 UTC  — Ares triage (against ares.signals)
+#
+#   ── America/New_York anchored (DST-aware) ──────────────────
+#   Every day 09:00 NY   — Ares midday digest    (pre-NYSE-open heads-up)
+#   Every day 16:30 NY   — Ares postclose digest (after NYSE close)
 #
 # How to run:
 #   python scheduler.py
@@ -137,6 +146,19 @@ def run_lex_digest():
 # This is the architectural fix for the 31 May restart-loop bug.
 # =============================================================
 
+def run_ares_feed_ingestion():
+    """Fetch GNews articles for Ares entities and store as raw signals."""
+    logger.info("── Starting: ares.feed_ingestion ──")
+    try:
+        from ares.agents import feed_ingestion as ares_feed_ingestion
+        asyncio.run(ares_feed_ingestion.run_feed_ingestion())
+        logger.info("── Complete: ares.feed_ingestion ──")
+    except ImportError as e:
+        logger.error(f"── SKIPPED: ares.feed_ingestion not available — {e} ──")
+    except Exception as e:
+        logger.error(f"── FAILED: ares.feed_ingestion — {e} ──")
+
+
 def run_ares_triage():
     """Score untriaged signals in ares.signals using Claude Haiku 4.5."""
     logger.info("── Starting: ares.triage ──")
@@ -150,23 +172,63 @@ def run_ares_triage():
         logger.error(f"── FAILED: ares.triage — {e} ──")
 
 
+def run_ares_verifier():
+    """Process PENDING VERIFICATION items via EDGAR + Firecrawl + Sonnet."""
+    logger.info("── Starting: ares.verifier ──")
+    try:
+        from ares.agents import verifier as ares_verifier
+        asyncio.run(ares_verifier.run_verifier())
+        logger.info("── Complete: ares.verifier ──")
+    except ImportError as e:
+        logger.error(f"── SKIPPED: ares.verifier not available — {e} ──")
+    except Exception as e:
+        logger.error(f"── FAILED: ares.verifier — {e} ──")
+
+
+def run_ares_digest_morning():
+    """Comprehensive 24h-lookback briefing delivered at 07:15 UTC."""
+    logger.info("── Starting: ares.digest [morning] ──")
+    try:
+        from ares.agents import digest as ares_digest
+        asyncio.run(ares_digest.run_digest(briefing_type="morning"))
+        logger.info("── Complete: ares.digest [morning] ──")
+    except ImportError as e:
+        logger.error(f"── SKIPPED: ares.digest [morning] not available — {e} ──")
+    except Exception as e:
+        logger.error(f"── FAILED: ares.digest [morning] — {e} ──")
+
+
+def run_ares_digest_midday():
+    """Pre-NYSE-open heads-up at 09:00 America/New_York (6h lookback)."""
+    logger.info("── Starting: ares.digest [midday] ──")
+    try:
+        from ares.agents import digest as ares_digest
+        asyncio.run(ares_digest.run_digest(briefing_type="midday"))
+        logger.info("── Complete: ares.digest [midday] ──")
+    except ImportError as e:
+        logger.error(f"── SKIPPED: ares.digest [midday] not available — {e} ──")
+    except Exception as e:
+        logger.error(f"── FAILED: ares.digest [midday] — {e} ──")
+
+
+def run_ares_digest_postclose():
+    """Post-NYSE-close brief at 16:30 America/New_York (11h lookback)."""
+    logger.info("── Starting: ares.digest [postclose] ──")
+    try:
+        from ares.agents import digest as ares_digest
+        asyncio.run(ares_digest.run_digest(briefing_type="postclose"))
+        logger.info("── Complete: ares.digest [postclose] ──")
+    except ImportError as e:
+        logger.error(f"── SKIPPED: ares.digest [postclose] not available — {e} ──")
+    except Exception as e:
+        logger.error(f"── FAILED: ares.digest [postclose] — {e} ──")
+
+
 # ─── TODO: Ares agents not yet built ──────────────────────────
 # Uncomment and wire up each as the corresponding agent is built.
 # Each follows the lazy-import pattern above.
 #
-# def run_ares_feed_ingestion():
-#     logger.info("── Starting: ares.feed_ingestion ──")
-#     try:
-#         from ares.agents import feed_ingestion as ares_feed_ingestion
-#         asyncio.run(ares_feed_ingestion.run_feed_ingestion())
-#         logger.info("── Complete: ares.feed_ingestion ──")
-#     except ImportError as e:
-#         logger.error(f"── SKIPPED: ares.feed_ingestion not available — {e} ──")
-#     except Exception as e:
-#         logger.error(f"── FAILED: ares.feed_ingestion — {e} ──")
-#
 # def run_ares_financial_snapshot(): ...
-# def run_ares_digest(): ...
 # def run_ares_deep_analysis(): ...
 # def run_ares_trade_proposal(): ...
 # def run_ares_execution(): ...
@@ -248,33 +310,91 @@ if __name__ == "__main__":
         misfire_grace_time=600,
     )
 
-    # ── Ares ──────────────────────────────────────────────────
-    # Only triage wired up — other Ares jobs commented out below
-    # until their agents are built. See TODO section above.
+    # ── Ares: Feed Ingestion ─────────────────────────────────
+    # 3x daily, UTC-anchored, spaced to feed each briefing window
+    # while staying inside GNews 100/day rate limit.
 
     scheduler.add_job(
-        run_ares_triage,
-        trigger=CronTrigger(hour=6, minute=45),
-        id="ares_triage",
-        name="Ares Triage",
+        run_ares_feed_ingestion,
+        trigger=CronTrigger(hour="5,12,19", minute=0),
+        id="ares_feed_ingestion",
+        name="Ares Feed Ingestion",
         misfire_grace_time=300,
     )
 
-    # ─── TODO: Ares job schedules (uncomment as agents land) ──
-    # scheduler.add_job(run_ares_feed_ingestion,
-    #     trigger=CronTrigger(hour=6, minute=0),
-    #     id="ares_feed_ingestion", name="Ares Feed Ingestion",
-    #     misfire_grace_time=300)
-    #
+    # ── Ares: Triage ─────────────────────────────────────────
+    # Runs 15-30 min after each ingestion to score fresh signals.
+    # NB: 12:15 sits cleanly between Mímir 12:00 ingestion and 12:30 triage.
+
+    scheduler.add_job(
+        run_ares_triage,
+        trigger=CronTrigger(hour=5, minute=30),
+        id="ares_triage_morning",
+        name="Ares Triage (morning)",
+        misfire_grace_time=300,
+    )
+
+    scheduler.add_job(
+        run_ares_triage,
+        trigger=CronTrigger(hour=12, minute=15),
+        id="ares_triage_midday",
+        name="Ares Triage (midday)",
+        misfire_grace_time=300,
+    )
+
+    scheduler.add_job(
+        run_ares_triage,
+        trigger=CronTrigger(hour=19, minute=15),
+        id="ares_triage_postclose",
+        name="Ares Triage (postclose)",
+        misfire_grace_time=300,
+    )
+
+    # ── Ares: Briefings ───────────────────────────────────────
+    # Morning at UTC (UK-anchored). Midday and postclose at NY local
+    # (DST-aware via timezone parameter on CronTrigger).
+
+    scheduler.add_job(
+        run_ares_digest_morning,
+        trigger=CronTrigger(hour=7, minute=15),
+        id="ares_digest_morning",
+        name="Ares Morning Digest",
+        misfire_grace_time=600,
+    )
+
+    scheduler.add_job(
+        run_ares_digest_midday,
+        trigger=CronTrigger(hour=9, minute=0, timezone="America/New_York"),
+        id="ares_digest_midday",
+        name="Ares Midday Brief",
+        misfire_grace_time=600,
+    )
+
+    scheduler.add_job(
+        run_ares_digest_postclose,
+        trigger=CronTrigger(hour=16, minute=30, timezone="America/New_York"),
+        id="ares_digest_postclose",
+        name="Ares Post-Close Brief",
+        misfire_grace_time=600,
+    )
+
+    # ── Ares: Verifier ────────────────────────────────────────
+    # Daily after morning brief — processes PENDING VERIFICATION items
+    # surfaced by overnight signal flow.
+
+    scheduler.add_job(
+        run_ares_verifier,
+        trigger=CronTrigger(hour=7, minute=30),
+        id="ares_verifier",
+        name="Ares Verifier",
+        misfire_grace_time=600,
+    )
+
+    # ─── TODO: Ares execution jobs (uncomment as agents land) ──
     # scheduler.add_job(run_ares_financial_snapshot,
     #     trigger=CronTrigger(hour=6, minute=15),
     #     id="ares_financial_snapshot", name="Ares Financial Snapshot",
     #     misfire_grace_time=300)
-    #
-    # scheduler.add_job(run_ares_digest,
-    #     trigger=CronTrigger(hour=7, minute=15),
-    #     id="ares_digest", name="Ares Digest",
-    #     misfire_grace_time=600)
     #
     # scheduler.add_job(run_ares_deep_analysis,
     #     trigger=CronTrigger(day_of_week="sun", hour=6, minute=0),

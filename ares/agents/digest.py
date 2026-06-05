@@ -1,30 +1,28 @@
 """
-Trygg Ares — Digest Agent
-=========================
+Trygg Ares — Digest Agent (multi-briefing-type)
+================================================
 
-Synthesises triaged signals into a daily briefing using Claude Sonnet 4.6.
+Synthesises triaged signals into a briefing via Claude Sonnet 4.6. Supports
+three briefing types selected via BRIEFING_TYPE env var or function parameter:
 
-Discipline applied per Source-Authority Spec v1:
-- Inline provenance: every numeric claim cites source + tier
-- Tier 4 sources excluded unless flagged is_recency_critical
-- Tier breakdown stored in ares.digests for audit
-- Highest-tier source preferred when signals corroborate same fact
+  - morning   (07:00 UTC, 24h lookback, comprehensive review)
+      Read in UK morning before US markets open.
+  - midday    (09:00 America/New_York, 6h lookback, pre-open heads-up)
+      Read 30 min before NYSE open. Short, focused on what's new since morning.
+  - postclose (16:30 America/New_York, 11h lookback, post-close brief)
+      Read after NYSE close. What moved today and what filed after-hours.
 
-Inclusion threshold (OR conditions — any one triggers inclusion):
-- relevance_score >= 6
-- is_recency_critical = TRUE
-- narrative_score >= 7
+Each briefing type uses its own system prompt and lookback window. Everything
+else (Telegram delivery, ledger storage, tier_breakdown audit) is shared.
 
-Telegram delivery:
-- Direct HTTP via aiohttp (avoids the python-telegram-bot async/sync issue
-  that caused seven days of Mímir silence)
-- Chunked at 3500 chars to stay below Telegram's 4096 limit
-- Markdown parse mode for inline formatting
+Usage:
+  python -m ares.agents.digest                          # default: morning
+  BRIEFING_TYPE=midday python -m ares.agents.digest
+  BRIEFING_TYPE=postclose python -m ares.agents.digest
+  DIGEST_SKIP_SEND=true python -m ares.agents.digest    # preview to stdout
 
-CLI smoke-test mode:
-- Set DIGEST_SKIP_SEND=true to generate digest without Telegram delivery
-
-Schedule via scheduler.py — runs daily at 07:15 UTC (after Ares triage).
+When called from scheduler.py:
+  await run_digest(briefing_type="postclose")
 """
 
 import asyncio
@@ -40,8 +38,36 @@ import asyncpg
 from dotenv import load_dotenv
 
 load_dotenv()
-
 logger = logging.getLogger(__name__)
+
+
+# -----------------------------------------------------------------------------
+# Briefing type configuration
+# -----------------------------------------------------------------------------
+
+BRIEFING_TYPES = {
+    "morning": {
+        "lookback_hours": 24,
+        "prompt_file": "digest_prompt.md",
+        "job_name": "ares_digest_morning",
+        "label": "Morning Briefing",
+        "description": "Comprehensive 24h review. Read in UK morning before US markets open.",
+    },
+    "midday": {
+        "lookback_hours": 6,
+        "prompt_file": "digest_midday_prompt.md",
+        "job_name": "ares_digest_midday",
+        "label": "Pre-Open Heads-Up",
+        "description": "Light brief covering 6h since morning. Read 30 min before NYSE open.",
+    },
+    "postclose": {
+        "lookback_hours": 11,
+        "prompt_file": "digest_postclose_prompt.md",
+        "job_name": "ares_digest_postclose",
+        "label": "Post-Close Brief",
+        "description": "Day's flow and after-hours filings. Read after NYSE close.",
+    },
+}
 
 
 # -----------------------------------------------------------------------------
@@ -54,22 +80,30 @@ TELEGRAM_BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN")
 SKIP_SEND = os.getenv("DIGEST_SKIP_SEND", "").lower() in ("true", "1", "yes")
 
 DIGEST_MODEL = "claude-sonnet-4-6"
-
 RELEVANCE_THRESHOLD = 6
 NARRATIVE_THRESHOLD = 7
-LOOKBACK_HOURS = 24
-
 MAX_OUTPUT_TOKENS = 4096
 TELEGRAM_MAX_CHARS = 3500
 MAX_BODY_CHARS_PER_SIGNAL = 800
 
-PROMPT_PATH = Path(__file__).parent / "digest_prompt.md"
-if not PROMPT_PATH.exists():
-    raise FileNotFoundError(
-        f"Digest prompt not found at {PROMPT_PATH}. "
-        "The prompt is a required dependency."
-    )
-SYSTEM_PROMPT = PROMPT_PATH.read_text(encoding="utf-8")
+
+def get_briefing_config(briefing_type: str) -> dict:
+    """Resolve briefing config dict from the type string."""
+    bt = (briefing_type or "morning").lower()
+    if bt not in BRIEFING_TYPES:
+        logger.warning("Unknown briefing_type %r; defaulting to morning", bt)
+        bt = "morning"
+    return {"key": bt, **BRIEFING_TYPES[bt]}
+
+
+def load_system_prompt(prompt_file: str) -> str:
+    """Load a prompt file from the agent directory."""
+    path = Path(__file__).parent / prompt_file
+    if not path.exists():
+        raise FileNotFoundError(
+            f"Digest prompt not found at {path}. Required dependency."
+        )
+    return path.read_text(encoding="utf-8")
 
 
 # -----------------------------------------------------------------------------
@@ -77,7 +111,6 @@ SYSTEM_PROMPT = PROMPT_PATH.read_text(encoding="utf-8")
 # -----------------------------------------------------------------------------
 
 def format_signal_for_prompt(signal: dict) -> str:
-    """Format one signal as a structured block for the digest prompt."""
     body_excerpt = (signal.get("body") or "")[:MAX_BODY_CHARS_PER_SIGNAL]
     return (
         f"---\n"
@@ -103,8 +136,7 @@ def format_signal_for_prompt(signal: dict) -> str:
 # -----------------------------------------------------------------------------
 
 def chunk_for_telegram(text: str, max_chars: int = TELEGRAM_MAX_CHARS) -> list:
-    """Split text on paragraph boundaries to fit Telegram's 4096-char limit."""
-    chunks: list = []
+    chunks = []
     remaining = text
     while remaining:
         if len(remaining) <= max_chars:
@@ -125,7 +157,6 @@ async def send_telegram_message(
     chat_id: int,
     text: str,
 ) -> bool:
-    """Send a Telegram message via direct HTTP. Returns True on success."""
     if not TELEGRAM_BOT_TOKEN:
         logger.error("TELEGRAM_BOT_TOKEN not set — cannot send")
         return False
@@ -166,40 +197,55 @@ async def send_telegram_message(
 # Main digest run
 # -----------------------------------------------------------------------------
 
-async def run_digest():
-    """Pull recent triaged signals, synthesise briefing, deliver."""
+async def run_digest(briefing_type: str = None):
+    """
+    Pull recent triaged signals, synthesise via Sonnet, deliver to Telegram.
+
+    Args:
+        briefing_type: 'morning' | 'midday' | 'postclose'.
+                       Falls back to BRIEFING_TYPE env var, then 'morning'.
+    """
+    if briefing_type is None:
+        briefing_type = os.getenv("BRIEFING_TYPE", "morning")
+    config = get_briefing_config(briefing_type)
+
+    logger.info(
+        "Starting %s digest: %s (lookback=%dh, prompt=%s)",
+        config["key"], config["label"],
+        config["lookback_hours"], config["prompt_file"],
+    )
 
     if not DATABASE_URL:
-        logger.error("DATABASE_URL not set in .env — aborting")
+        logger.error("DATABASE_URL not set — aborting")
         return
     if not ANTHROPIC_API_KEY:
-        logger.error("ANTHROPIC_API_KEY not set in .env — aborting")
+        logger.error("ANTHROPIC_API_KEY not set — aborting")
         return
     if not TELEGRAM_BOT_TOKEN and not SKIP_SEND:
         logger.warning(
             "TELEGRAM_BOT_TOKEN not set — digest will be generated but not delivered"
         )
-
     if SKIP_SEND:
         logger.info("DIGEST_SKIP_SEND=true — digest will print to stdout, not Telegram")
+
+    system_prompt = load_system_prompt(config["prompt_file"])
 
     pool = await asyncpg.create_pool(DATABASE_URL, min_size=2, max_size=5)
     client = anthropic.AsyncAnthropic(api_key=ANTHROPIC_API_KEY)
 
-    # Open audit row
     try:
         async with pool.acquire() as conn:
             job_run_id = await conn.fetchval("""
                 INSERT INTO platform.job_runs (job_name, job_module, started_at, status)
-                VALUES ('ares_digest', 'ares.agents.digest', NOW(), 'running')
+                VALUES ($1, 'ares.agents.digest', NOW(), 'running')
                 RETURNING id
-            """)
+            """, config["job_name"])
     except asyncpg.PostgresError as e:
         logger.warning("Could not insert job_run row: %s", e)
         job_run_id = None
 
-    # Pull signals meeting threshold
-    cutoff = datetime.now(timezone.utc) - timedelta(hours=LOOKBACK_HOURS)
+    lookback_hours = config["lookback_hours"]
+    cutoff = datetime.now(timezone.utc) - timedelta(hours=lookback_hours)
     async with pool.acquire() as conn:
         signals = await conn.fetch("""
             SELECT
@@ -226,9 +272,8 @@ async def run_digest():
 
     if not signals:
         logger.info(
-            "No signals meet digest threshold (relevance >= %d OR critical OR narrative >= %d) "
-            "in last %d hours — skipping",
-            RELEVANCE_THRESHOLD, NARRATIVE_THRESHOLD, LOOKBACK_HOURS
+            "No signals meet threshold for %s digest (lookback=%dh) — skipping",
+            config["key"], lookback_hours,
         )
         if job_run_id is not None:
             async with pool.acquire() as conn:
@@ -241,9 +286,8 @@ async def run_digest():
         await client.close()
         return
 
-    logger.info("Synthesising digest from %d signals", len(signals))
+    logger.info("Synthesising %s digest from %d signals", config["key"], len(signals))
 
-    # Tier breakdown audit
     tier_breakdown = {f"tier_{i}": 0 for i in range(1, 5)}
     for s in signals:
         t = s["source_tier"]
@@ -251,12 +295,12 @@ async def run_digest():
             tier_breakdown[f"tier_{t}"] += 1
     logger.info("Tier breakdown of input signals: %s", tier_breakdown)
 
-    # Build user message
     today = date.today()
     signal_blocks = [format_signal_for_prompt(dict(s)) for s in signals]
     user_message = (
+        f"Briefing type: {config['label']}\n"
         f"Today's date: {today.strftime('%A, %d %B %Y')}\n"
-        f"Window: Last {LOOKBACK_HOURS} hours\n"
+        f"Lookback window: Last {lookback_hours} hours\n"
         f"Signals to synthesise: {len(signals)}\n"
         f"Tier breakdown: {tier_breakdown}\n\n"
         f"=== SIGNALS ===\n\n"
@@ -264,7 +308,6 @@ async def run_digest():
         + "\n\nSynthesise into a Trygg Ares Briefing per the structure in your system prompt."
     )
 
-    # Sonnet 4.6 synthesis
     try:
         response = await client.messages.create(
             model=DIGEST_MODEL,
@@ -272,7 +315,7 @@ async def run_digest():
             system=[
                 {
                     "type": "text",
-                    "text": SYSTEM_PROMPT,
+                    "text": system_prompt,
                     "cache_control": {"type": "ephemeral"},
                 }
             ],
@@ -286,9 +329,11 @@ async def run_digest():
 
     digest_content = response.content[0].text.strip()
 
-    # No-signal sentinel from the model
     if digest_content == "NO_SIGNIFICANT_SIGNALS":
-        logger.info("Sonnet judged no significant signals warrant a briefing — no delivery")
+        logger.info(
+            "Sonnet judged no significant signals warrant a %s briefing — no delivery",
+            config["key"]
+        )
         if job_run_id is not None:
             async with pool.acquire() as conn:
                 await conn.execute("""
@@ -300,7 +345,6 @@ async def run_digest():
         await client.close()
         return
 
-    # Store digest
     signal_ids = [s["id"] for s in signals]
     async with pool.acquire() as conn:
         digest_id = await conn.fetchval("""
@@ -309,10 +353,11 @@ async def run_digest():
                 signal_count, relevance_threshold, has_inline_provenance,
                 tier_breakdown, digest_model, generation_run_id
             )
-            VALUES ($1, 'daily', $2, $3, $4, $5, TRUE, $6, $7, $8)
+            VALUES ($1, $2, $3, $4, $5, $6, TRUE, $7, $8, $9)
             RETURNING id
         """,
             today,
+            config["key"],
             digest_content,
             signal_ids,
             len(signals),
@@ -323,14 +368,13 @@ async def run_digest():
         )
 
     logger.info(
-        "Digest %d stored — %d signals, tier breakdown: %s",
-        digest_id, len(signals), tier_breakdown
+        "%s digest %d stored — %d signals, tier breakdown: %s",
+        config["label"], digest_id, len(signals), tier_breakdown,
     )
 
-    # Skip-send mode: print and return
     if SKIP_SEND:
         print("\n" + "=" * 70)
-        print("DIGEST PREVIEW (SKIP_SEND mode — not delivered to Telegram)")
+        print(f"{config['label'].upper()} PREVIEW (SKIP_SEND mode — not delivered to Telegram)")
         print("=" * 70 + "\n")
         print(digest_content)
         print("\n" + "=" * 70 + "\n")
@@ -345,7 +389,6 @@ async def run_digest():
         await client.close()
         return
 
-    # Deliver to premium clients
     async with pool.acquire() as conn:
         clients = await conn.fetch("""
             SELECT id, name, telegram_chat_id
@@ -368,7 +411,8 @@ async def run_digest():
                         c["name"], chat_id_raw
                     )
                     continue
-                logger.info("Sending digest to %s (chat %d)", c["name"], chat_id_int)
+                logger.info("Sending %s digest to %s (chat %d)",
+                            config["key"], c["name"], chat_id_int)
                 ok = await send_telegram_message(session, chat_id_int, digest_content)
                 if ok:
                     sent_to.append(c["id"])
@@ -380,7 +424,8 @@ async def run_digest():
                 WHERE id = $2
             """, sent_to, digest_id)
 
-        logger.info("Digest delivered to %d/%d clients", len(sent_to), len(clients))
+        logger.info("%s digest delivered to %d/%d clients",
+                    config["label"], len(sent_to), len(clients))
 
     if job_run_id is not None:
         async with pool.acquire() as conn:
@@ -392,7 +437,7 @@ async def run_digest():
 
     await pool.close()
     await client.close()
-    logger.info("Digest run complete")
+    logger.info("%s digest run complete", config["label"])
 
 
 # -----------------------------------------------------------------------------
